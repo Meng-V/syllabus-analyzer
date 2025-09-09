@@ -102,12 +102,20 @@ def call_llm_for_metadata(pdf_text: str) -> Dict:
         "year, semester, class_name, class_number, instructor, university, main_topic, reading_materials.\n\n"
         "Rules:\n"
         "- main_topic: Course focus, objectives, and key learning outcomes\n"
-        "- reading_materials: Array of objects with keys: title, media_type, requirement, ISBN, url, journal_names, certainty\n"
-        "- media_type options: 'books', 'journal articles', 'book chapters', 'websites', 'videos', 'equipment'\n"
+        "- reading_materials: Array of objects with keys: title, type, requirement, creator, author, ISBN, url, journal_names, certainty\n"
+        "- type options: 'book', 'journal_article', 'book_chapter', 'website', 'video', 'software', 'hardware', 'equipment'\n"
         "- requirement: 'required' or 'suggested'\n"
+        "- creator/author: Author or creator name when available\n"
         "- certainty: 0-100 (confidence in extraction accuracy)\n"
         "- Use 'Unknown' for missing information\n"
-        "- No hallucination - only extract what is clearly present"
+        "- No hallucination - only extract what is clearly present\n\n"
+        "IMPORTANT: For equipment, hardware, and software requirements:\n"
+        "- Clearly distinguish between traditional library materials (books, articles) and technical requirements\n"
+        "- Use 'software' for applications, programs, or digital tools (e.g., SPSS, Adobe Creative Suite, VPN software)\n"
+        "- Use 'hardware' for physical devices or equipment (e.g., USB headset, network-capable computer, microphone)\n"
+        "- Use 'equipment' for specialized tools, instruments, or lab equipment\n"
+        "- These technical requirements are typically NOT available in traditional library catalogs\n"
+        "- Pay special attention to technology requirements, computer specifications, and specialized tools"
     )
 
     user_prompt = (

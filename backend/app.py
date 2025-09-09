@@ -6,7 +6,7 @@ FastAPI server providing endpoints for the complete syllabus analysis workflow
 
 from fastapi import FastAPI, HTTPException, BackgroundTasks, UploadFile, File
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, StreamingResponse
 from pydantic import BaseModel, HttpUrl
 from typing import List, Dict, Any, Optional
 import os
@@ -16,6 +16,8 @@ import uuid
 from pathlib import Path
 import shutil
 from datetime import datetime
+import csv
+import io
 
 # Import your existing modules
 import sys
@@ -547,6 +549,168 @@ async def download_results(job_id: str):
         return FileResponse(regular_file, filename=f"syllabus_analysis_{job_id}_metadata.json")
     else:
         raise HTTPException(status_code=404, detail="Results not found")
+
+@app.get("/api/download-csv/{job_id}")
+async def download_csv(job_id: str):
+    """Download results as CSV file"""
+    if job_id not in jobs_status:
+        raise HTTPException(status_code=404, detail="Job not found")
+    
+    # Check for Primo results first, then regular results
+    primo_file = RESULTS_DIR / f"{job_id}_primo_results.json"
+    regular_file = RESULTS_DIR / f"{job_id}_metadata.json"
+    
+    results_file = primo_file if primo_file.exists() else regular_file
+    if not results_file.exists():
+        raise HTTPException(status_code=404, detail="Results not found")
+    
+    try:
+        with open(results_file, 'r') as f:
+            results = json.load(f)
+        
+        # Create CSV content
+        csv_content = generate_csv_from_results(results)
+        
+        # Create streaming response
+        def iter_csv():
+            yield csv_content.encode('utf-8')
+        
+        headers = {
+            'Content-Disposition': f'attachment; filename="syllabus_analysis_{job_id}.csv"',
+            'Content-Type': 'text/csv; charset=utf-8'
+        }
+        
+        return StreamingResponse(iter_csv(), media_type="text/csv", headers=headers)
+        
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Error generating CSV: {str(e)}")
+
+def generate_csv_from_results(results: List[Dict]) -> str:
+    """Generate CSV content from results data"""
+    if not results:
+        return "No data available"
+    
+    # Create CSV in memory
+    output = io.StringIO()
+    
+    # Determine all possible fields from all results
+    all_fields = set(['filename'])
+    for result in results:
+        if 'metadata' in result:
+            all_fields.update(result['metadata'].keys())
+    
+    # Remove reading_materials from regular fields (we'll handle it separately)
+    regular_fields = [f for f in sorted(all_fields) if f != 'reading_materials']
+    
+    # Add reading materials columns
+    reading_materials_fields = [
+        'reading_materials_count',
+        'required_materials',
+        'optional_materials',
+        'reading_materials_list'
+    ]
+    
+    # Add library matching fields
+    library_fields = [
+        'library_matches_count',
+        'available_resources',
+        'unavailable_resources'
+    ]
+    
+    fieldnames = regular_fields + reading_materials_fields + library_fields
+    
+    writer = csv.DictWriter(output, fieldnames=fieldnames)
+    writer.writeheader()
+    
+    for result in results:
+        row = {}
+        
+        # Add filename
+        row['filename'] = result.get('filename', '')
+        
+        # Add regular metadata fields
+        metadata = result.get('metadata', {})
+        for field in regular_fields:
+            if field == 'filename':
+                continue
+            value = metadata.get(field, '')
+            # Convert lists to string representation (except reading_materials)
+            if isinstance(value, list) and field != 'reading_materials':
+                row[field] = '; '.join(str(item) for item in value)
+            else:
+                row[field] = str(value) if value is not None else ''
+        
+        # Handle reading materials
+        reading_materials = metadata.get('reading_materials', [])
+        if reading_materials:
+            required_materials = []
+            optional_materials = []
+            all_materials = []
+            
+            for item in reading_materials:
+                if isinstance(item, dict):
+                    title = item.get('title', 'Unknown Title')
+                    author = item.get('creator') or item.get('author', '')
+                    requirement = item.get('requirement', 'optional')
+                    material_type = item.get('type', 'book')
+                    
+                    material_str = f"{title}"
+                    if author:
+                        material_str += f" by {author}"
+                    material_str += f" ({material_type})"
+                    
+                    all_materials.append(material_str)
+                    if requirement == 'required':
+                        required_materials.append(material_str)
+                    else:
+                        optional_materials.append(material_str)
+                else:
+                    material_str = str(item)
+                    all_materials.append(material_str)
+                    optional_materials.append(material_str)
+            
+            row['reading_materials_count'] = len(reading_materials)
+            row['required_materials'] = '; '.join(required_materials)
+            row['optional_materials'] = '; '.join(optional_materials)
+            row['reading_materials_list'] = '; '.join(all_materials)
+        else:
+            row['reading_materials_count'] = 0
+            row['required_materials'] = ''
+            row['optional_materials'] = ''
+            row['reading_materials_list'] = ''
+        
+        # Handle library matches
+        library_matches = result.get('library_matches', [])
+        if library_matches:
+            available_count = 0
+            unavailable_count = 0
+            available_resources = []
+            unavailable_resources = []
+            
+            for match in library_matches:
+                if isinstance(match, dict) and 'matches' in match:
+                    for resource in match.get('matches', []):
+                        if isinstance(resource, dict):
+                            title = resource.get('title', 'Unknown')
+                            availability = resource.get('availability', 'unknown')
+                            if availability == 'available':
+                                available_count += 1
+                                available_resources.append(title)
+                            else:
+                                unavailable_count += 1
+                                unavailable_resources.append(f"{title} ({availability})")
+            
+            row['library_matches_count'] = len(library_matches)
+            row['available_resources'] = '; '.join(available_resources)
+            row['unavailable_resources'] = '; '.join(unavailable_resources)
+        else:
+            row['library_matches_count'] = 0
+            row['available_resources'] = ''
+            row['unavailable_resources'] = ''
+        
+        writer.writerow(row)
+    
+    return output.getvalue()
 
 if __name__ == "__main__":
     import uvicorn
