@@ -77,6 +77,12 @@ export default function SyllabusAnalyzer() {
   const [currentJob, setCurrentJob] = useState<JobStatus | null>(null)
   const [error, setError] = useState<string | null>(null)
   const [jobs, setJobs] = useState<JobStatus[]>([])
+  const [libraryMatchingStatus, setLibraryMatchingStatus] = useState<{
+    isProcessing: boolean
+    progress: number
+    message: string
+    error: string | null
+  }>({ isProcessing: false, progress: 0, message: "", error: null })
 
   // Load available metadata fields on component mount
   useEffect(() => {
@@ -93,6 +99,16 @@ export default function SyllabusAnalyzer() {
       return () => clearInterval(interval)
     }
   }, [currentJob])
+
+  // Poll for library matching progress when in results step
+  useEffect(() => {
+    if (currentStep === "results" && currentJob && libraryMatches.length === 0 && selectedFields.includes("reading_materials")) {
+      const interval = setInterval(() => {
+        checkLibraryMatchingProgress(currentJob.job_id)
+      }, 3000) // Poll every 3 seconds for library matching
+      return () => clearInterval(interval)
+    }
+  }, [currentStep, currentJob, libraryMatches.length, selectedFields])
 
   const fetchAvailableFields = async () => {
     try {
@@ -134,6 +150,15 @@ export default function SyllabusAnalyzer() {
       } else if (jobStatus.status === "completed" && currentStep === "results") {
         // Reload results to get updated library matches after Primo check
         await loadResults(jobId)
+        // Update library matching status if it was processing
+        if (libraryMatchingStatus.isProcessing) {
+          setLibraryMatchingStatus({
+            isProcessing: false,
+            progress: 100,
+            message: "Library resource matching completed!",
+            error: null
+          })
+        }
       } else if (jobStatus.status === "error" || jobStatus.status === "failed") {
         setError(jobStatus.message || "Job failed with unknown error")
         setIsProcessing(false)
@@ -298,21 +323,79 @@ export default function SyllabusAnalyzer() {
       
       // Start Primo check if reading materials are selected and no library matches yet
       if (selectedFields.includes("reading_materials") && matches.length === 0) {
+        setLibraryMatchingStatus({
+          isProcessing: true,
+          progress: 0,
+          message: "Starting library resource matching...",
+          error: null
+        })
         await startPrimoCheck(jobId)
       }
     } catch (err) {
       console.error("Failed to load results:", err)
+      setError("Failed to load results. Please try again.")
     }
   }
 
   const startPrimoCheck = async (jobId: string) => {
     try {
-      await fetch(`${API_BASE_URL}/api/check-primo/${jobId}`, {
+      const response = await fetch(`${API_BASE_URL}/api/check-primo/${jobId}`, {
         method: "POST"
       })
+      
+      if (!response.ok) {
+        throw new Error(`Failed to start library matching: ${response.status}`)
+      }
+      
       // Results will be updated via polling
     } catch (err) {
       console.error("Failed to start Primo check:", err)
+      setLibraryMatchingStatus({
+        isProcessing: false,
+        progress: 0,
+        message: "",
+        error: "Failed to start library resource matching. Please check your connection and try again."
+      })
+    }
+  }
+
+  const checkLibraryMatchingProgress = async (jobId: string) => {
+    try {
+      const response = await fetch(`${API_BASE_URL}/api/job-status/${jobId}`)
+      if (!response.ok) {
+        throw new Error(`Failed to check status: ${response.status}`)
+      }
+      
+      const jobStatus = await response.json()
+      
+      // Check if this is a library matching operation in progress
+      if (jobStatus.status === "processing" && jobStatus.message && 
+          (jobStatus.message.includes("Checking resources") || 
+           jobStatus.message.includes("library resources") ||
+           jobStatus.message.includes("Primo API"))) {
+        setLibraryMatchingStatus({
+          isProcessing: true,
+          progress: jobStatus.progress || 0,
+          message: jobStatus.message,
+          error: null
+        })
+      } else if (jobStatus.status === "completed") {
+        // Check if we now have library matches
+        await loadResults(jobId)
+      } else if (jobStatus.status === "error" || jobStatus.status === "failed") {
+        setLibraryMatchingStatus({
+          isProcessing: false,
+          progress: 0,
+          message: "",
+          error: jobStatus.message || "Library resource matching failed"
+        })
+      }
+    } catch (err) {
+      console.error("Failed to check library matching progress:", err)
+      setLibraryMatchingStatus(prev => ({
+        ...prev,
+        error: "Unable to check progress. Please refresh the page."
+      }))
     }
   }
 
@@ -347,6 +430,7 @@ export default function SyllabusAnalyzer() {
     setCurrentJob(null)
     setError(null)
     setIsProcessing(false)
+    setLibraryMatchingStatus({ isProcessing: false, progress: 0, message: "", error: null })
   }
 
   return (
@@ -831,13 +915,82 @@ export default function SyllabusAnalyzer() {
               
               {libraryMatches.length === 0 ? (
                 <Card>
-                  <CardContent className="text-center py-8">
-                    <Book className="w-12 h-12 mx-auto mb-4 opacity-50" />
-                    <p className="text-muted-foreground">
-                      {selectedFields.includes("reading_materials") 
-                        ? "Processing library resources... This may take a moment."
-                        : "No reading materials selected for library matching."}
-                    </p>
+                  <CardContent className="py-8">
+                    {!selectedFields.includes("reading_materials") ? (
+                      <div className="text-center">
+                        <Book className="w-12 h-12 mx-auto mb-4 opacity-50" />
+                        <p className="text-muted-foreground">
+                          No reading materials selected for library matching.
+                        </p>
+                      </div>
+                    ) : libraryMatchingStatus.error ? (
+                      <div className="text-center space-y-4">
+                        <AlertCircle className="w-12 h-12 mx-auto mb-4 text-red-500" />
+                        <div>
+                          <p className="text-red-600 font-medium mb-2">Library Matching Error</p>
+                          <p className="text-sm text-muted-foreground mb-4">{libraryMatchingStatus.error}</p>
+                          <Button 
+                            variant="outline" 
+                            size="sm"
+                            onClick={() => {
+                              setLibraryMatchingStatus({ isProcessing: false, progress: 0, message: "", error: null })
+                              if (currentJob) startPrimoCheck(currentJob.job_id)
+                            }}
+                          >
+                            Retry Library Matching
+                          </Button>
+                        </div>
+                      </div>
+                    ) : libraryMatchingStatus.isProcessing ? (
+                      <div className="space-y-4">
+                        <div className="flex items-center justify-center gap-3 mb-4">
+                          <Loader2 className="w-6 h-6 animate-spin text-accent" />
+                          <span className="font-medium">Matching Library Resources</span>
+                        </div>
+                        
+                        <div className="space-y-2">
+                          <div className="flex justify-between text-sm">
+                            <span>Progress</span>
+                            <span>{libraryMatchingStatus.progress}%</span>
+                          </div>
+                          <Progress value={libraryMatchingStatus.progress} className="w-full" />
+                        </div>
+                        
+                        <p className="text-sm text-muted-foreground text-center">
+                          {libraryMatchingStatus.message || "Searching library catalog for reading materials..."}
+                        </p>
+                        
+                        <div className="text-xs text-muted-foreground text-center space-y-1">
+                          <p>• Analyzing extracted reading materials</p>
+                          <p>• Searching library catalog via Primo API</p>
+                          <p>• Checking availability and formats</p>
+                        </div>
+                      </div>
+                    ) : (
+                      <div className="text-center">
+                        <Book className="w-12 h-12 mx-auto mb-4 opacity-50" />
+                        <p className="text-muted-foreground mb-4">
+                          Ready to search library resources for reading materials.
+                        </p>
+                        <Button 
+                          variant="outline" 
+                          size="sm"
+                          onClick={() => {
+                            if (currentJob) {
+                              setLibraryMatchingStatus({
+                                isProcessing: true,
+                                progress: 0,
+                                message: "Starting library resource matching...",
+                                error: null
+                              })
+                              startPrimoCheck(currentJob.job_id)
+                            }
+                          }}
+                        >
+                          Start Library Matching
+                        </Button>
+                      </div>
+                    )}
                   </CardContent>
                 </Card>
               ) : (

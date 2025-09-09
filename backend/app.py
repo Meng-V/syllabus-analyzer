@@ -411,60 +411,125 @@ async def check_primo_resources(job_id: str, background_tasks: BackgroundTasks):
     if job_id not in jobs_status:
         raise HTTPException(status_code=404, detail="Job not found")
     
+    # Check if job is already processing library matching
+    current_status = jobs_status[job_id].get("status")
+    if current_status == "processing":
+        current_message = jobs_status[job_id].get("message", "")
+        if "Primo" in current_message or "library" in current_message.lower():
+            return {"status": "already_running", "message": "Library matching is already in progress"}
+    
     results_file = RESULTS_DIR / f"{job_id}_metadata.json"
     if not results_file.exists():
-        raise HTTPException(status_code=404, detail="Metadata results not found")
+        raise HTTPException(status_code=404, detail="Metadata results not found. Please ensure metadata extraction completed successfully.")
+    
+    # Validate results file
+    try:
+        with open(results_file, 'r') as f:
+            results = json.load(f)
+        if not results:
+            raise HTTPException(status_code=400, detail="No metadata results found to process")
+    except json.JSONDecodeError:
+        raise HTTPException(status_code=400, detail="Invalid metadata results file")
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Error reading metadata results: {str(e)}")
     
     # Start background task
     background_tasks.add_task(check_primo_background, job_id)
     
-    return {"status": "started", "message": "Primo availability check started"}
+    return {"status": "started", "message": "Library resource matching started successfully"}
 
 async def check_primo_background(job_id: str):
     """Background task to check reading materials via Primo API"""
     try:
         results_file = RESULTS_DIR / f"{job_id}_metadata.json"
         
+        if not results_file.exists():
+            jobs_status[job_id]["status"] = "error"
+            jobs_status[job_id]["message"] = "Metadata results file not found"
+            return
+        
         with open(results_file, 'r') as f:
             results = json.load(f)
         
+        if not results:
+            jobs_status[job_id]["status"] = "error"
+            jobs_status[job_id]["message"] = "No results found to process"
+            return
+        
         jobs_status[job_id]["status"] = "processing"
-        jobs_status[job_id]["message"] = "Checking library resources via Primo API..."
+        jobs_status[job_id]["progress"] = 0
+        jobs_status[job_id]["message"] = "Starting library resource matching via Primo API..."
+        
+        total_files = len(results)
+        processed_files = 0
+        successful_matches = 0
         
         for i, result in enumerate(results):
-            progress = int((i / len(results)) * 100)
-            jobs_status[job_id]["progress"] = progress
-            jobs_status[job_id]["message"] = f"Checking resources for {result['filename']} ({i+1}/{len(results)})"
-            
-            # Check reading materials using the new metadata-based approach
             try:
+                # Update progress with detailed status
+                progress = int((i / total_files) * 90)  # Reserve 10% for final processing
+                jobs_status[job_id]["progress"] = progress
+                jobs_status[job_id]["message"] = f"Checking resources for {result['filename']} ({i+1}/{total_files})"
+                
+                # Check if reading materials exist
+                reading_materials = result.get('metadata', {}).get('reading_materials', [])
+                if not reading_materials:
+                    result['primo_check'] = {
+                        "found": False,
+                        "error": "No reading materials found in metadata",
+                        "metadata": result['metadata']
+                    }
+                    result['library_matches'] = []
+                    continue
+                
+                # Check reading materials using the metadata-based approach
                 primo_result = await check_metadata_availability(result['metadata'])
                 result['primo_check'] = primo_result
                 
                 # Extract properly formatted library matches
-                result['library_matches'] = primo_result.get('library_matches', [])
+                library_matches = primo_result.get('library_matches', [])
+                result['library_matches'] = library_matches
+                
+                if library_matches:
+                    successful_matches += 1
                     
+                processed_files += 1
+                
             except Exception as e:
+                print(f"Error processing {result.get('filename', 'unknown')}: {str(e)}")
                 result['primo_check'] = {
                     "found": False,
-                    "error": str(e),
-                    "metadata": result['metadata']
+                    "error": f"API error: {str(e)}",
+                    "metadata": result.get('metadata', {})
                 }
                 result['library_matches'] = []
+                processed_files += 1
+        
+        # Final processing
+        jobs_status[job_id]["progress"] = 95
+        jobs_status[job_id]["message"] = "Saving library matching results..."
         
         # Save updated results
         primo_results_file = RESULTS_DIR / f"{job_id}_primo_results.json"
         with open(primo_results_file, 'w') as f:
             json.dump(results, f, indent=2)
         
+        # Complete with summary
         jobs_status[job_id]["status"] = "completed"
         jobs_status[job_id]["progress"] = 100
-        jobs_status[job_id]["message"] = "Primo availability check complete!"
+        jobs_status[job_id]["message"] = f"Library matching complete! Found matches for {successful_matches}/{processed_files} syllabi"
         jobs_status[job_id]["primo_results_file"] = str(primo_results_file)
         
-    except Exception as e:
+    except FileNotFoundError:
         jobs_status[job_id]["status"] = "error"
-        jobs_status[job_id]["message"] = f"Error: {str(e)}"
+        jobs_status[job_id]["message"] = "Results file not found. Please ensure metadata extraction completed successfully."
+    except json.JSONDecodeError:
+        jobs_status[job_id]["status"] = "error"
+        jobs_status[job_id]["message"] = "Invalid results file format. Please re-run metadata extraction."
+    except Exception as e:
+        print(f"Unexpected error in check_primo_background: {str(e)}")
+        jobs_status[job_id]["status"] = "error"
+        jobs_status[job_id]["message"] = f"Library matching failed: {str(e)}"
 
 @app.get("/api/download-results/{job_id}")
 async def download_results(job_id: str):
